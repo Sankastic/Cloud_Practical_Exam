@@ -1,0 +1,83 @@
+import boto3
+import json
+import logging
+import time
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+athena_client = boto3.client('athena')
+sns_client = boto3.client('sns')
+
+# replace this with your SNS Topic ARN
+SNS_TOPIC_ARN = 'arn:aws:sns:us-east-1:585056206710:data-quality-alerts'
+
+# Athena configuration
+ATHENA_DB = 'sales_data_db'
+ATHENA_OUTPUT = 's3://sanket-order-sales-reports/athena-results/'
+
+def run_athena_query(query):
+    """Execute Athena query and wait for result"""
+    response = athena_client.start_query_execution(
+        QueryString=query,
+        QueryExecutionContext={'Database': ATHENA_DB},
+        ResultConfiguration={'OutputLocation': ATHENA_OUTPUT}
+    )
+    query_execution_id = response['QueryExecutionId']
+
+    # Wait for query to complete
+    while True:
+        result = athena_client.get_query_execution(QueryExecutionId=query_execution_id)
+        state = result['QueryExecution']['Status']['State']
+        if state in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+            break
+        time.sleep(2)
+    return query_execution_id, state
+
+def lambda_handler(event, context):
+    try:
+        # Parse S3 event
+        record = event['Records'][0]
+        bucket = record['s3']['bucket']['name']
+        key = record['s3']['object']['key']
+
+        logger.info(f"Triggered for file: s3://{bucket}/{key}")
+
+        # Define data quality query
+        dq_query = """
+        SELECT COUNT(*) AS bad_records
+        FROM sales_data_db.orders_raw
+        WHERE order_id IS NULL OR order_id = ''
+           OR price < 0
+        """
+
+        # Run Athena query
+        query_id, status = run_athena_query(dq_query)
+
+        if status != 'SUCCEEDED':
+            logger.error(f"Athena query failed: {query_id}")
+            return {"status": "Athena query failed"}
+
+        # Fetch query results
+        result = athena_client.get_query_results(QueryExecutionId=query_id)
+        bad_count = int(result['ResultSet']['Rows'][1]['Data'][0]['VarCharValue'])
+
+        logger.info(f"Bad records found: {bad_count}")
+
+        # Send SNS alert if issues exist
+        if bad_count > 0:
+            message = f"⚠ Data quality issue detected!\nBad records: {bad_count}\nFile: s3://{bucket}/{key}"
+            sns_client.publish(
+                TopicArn=SNS_TOPIC_ARN,
+                Subject="Data Quality Alert - Invalid Orders",
+                Message=message
+            )
+            logger.info("Alert sent to SNS.")
+        else:
+            logger.info("No bad records found. Data quality OK.")
+
+        return {"status": "success", "bad_records": bad_count}
+
+    except Exception as e:
+        logger.error(f"Error in Lambda: {str(e)}", exc_info=True)
+        raise e
